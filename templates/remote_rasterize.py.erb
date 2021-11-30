@@ -1,0 +1,328 @@
+from typing import Optional
+
+from fastapi import FastAPI, Security, HTTPException, Depends
+from fastapi.security.api_key import APIKeyHeader, APIKeyQuery, APIKey
+
+from starlette.status import HTTP_403_FORBIDDEN
+
+from pydantic import BaseModel
+
+import asyncio
+
+
+from selenium import webdriver
+from selenium.common.exceptions import NoSuchElementException, InvalidArgumentException, TimeoutException
+import tempfile
+import base64
+import time
+import subprocess
+import traceback
+import re
+import os
+from datetime import datetime
+from urllib.parse import urlparse
+
+from cryptography.fernet import Fernet
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+
+
+API_KEY = 'gf6VJkASNWMYUCjrqmzB0DtDhCMahR0MNPTwMeMpWxGnO'
+api_key_header = APIKeyHeader(name="access_token")
+
+
+encrypt_key = b"gf6VJkASNWMYUCjrqmzB0DtDhCMahR0MNPTwMeMpWxGnO"
+salt = b'w\xdb\xfa\xb7T\x9e\x9c\xd6K|e\xc2\xe2$\xa0\xa9'
+
+kdf = PBKDF2HMAC(
+    algorithm=hashes.SHA256(),
+    length=32,
+    salt=salt,
+    iterations=390000,
+)
+
+key = base64.urlsafe_b64encode(kdf.derive(password))
+
+FERNET = Fernet(key)
+
+token = f.encrypt(b"Secret message!")
+
+
+f.decrypt(token)
+b'Secret message!'
+
+# Make sure our python code doesn't go through a proxy when communicating with chrome webdriver
+os.environ['no_proxy'] = 'localhost,127.0.0.1'
+
+WITH_ERRORS = True
+DEFAULT_WAIT_TIME = 0
+DEFAULT_PAGE_LOAD_TIME = 180
+
+
+URL_ERROR_MSG = "Can't access the URL. It might be malicious, or unreachable for one of several reasons. " \
+                "You can choose to receive this message as error/warning in the instance settings\n"
+EMPTY_RESPONSE_ERROR_MSG = "There is nothing to render. This can occur when there is a refused connection." \
+                           " Please check your URL."
+CHROME_USER_AGENT = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.164 Safari/537.36'  # noqa
+DRIVER_LOG = f'{tempfile.gettempdir()}/chromedriver.log'
+DEFAULT_CHROME_OPTIONS = [
+    '--no-sandbox',
+    '--headless',
+    '--disable-gpu',
+    '--hide-scrollbars',
+    '--disable_infobars',
+    '--start-maximized',
+    '--start-fullscreen',
+    '--ignore-certificate-errors',
+    '--disable-dev-shm-usage',
+    f'--user-agent={CHROME_USER_AGENT}'
+]
+
+# Comma separated list of --args
+USER_CHROME_OPTIONS = ""
+
+
+class Rasterize_Url(BaseModel):
+    url: str
+    user_agent: Optional[str] = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.164 Safari/537.36'
+    height: Optional[int] = 1200
+    width: Optional[int] = 1600
+
+class Rasterized_Url(BaseModel):
+    url: str
+    image_b64: str
+    file_name: str
+    html: str
+
+
+app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
+
+
+async def get_api_key(
+    api_key_header: str = Security(api_key_header)
+):
+
+    if api_key_header == API_KEY:
+        return api_key_header
+    else:
+        raise HTTPException(
+            status_code=HTTP_403_FORBIDDEN, detail="Could not validate credentials"
+        )
+
+
+@app.get("/rasterize_url/")
+async def create_rasterize_url(rasterize_url: Rasterize_Url, api_key: APIKey = Depends(get_api_key)):
+    rasterize_url_dict = rasterize_url.dict()
+
+    url = rasterize_url.url
+    w = rasterize_url.width
+    h = rasterize_url.height
+    wait_time = DEFAULT_WAIT_TIME
+    page_load = DEFAULT_PAGE_LOAD_TIME
+
+    if not (url.startswith('http')):
+        url = f"http://{url}"
+
+    output = rasterize(path=url, width=w, height=h, wait_time=wait_time, max_page_load_time=page_load)
+    
+    return output
+
+
+def return_err_or_warn(msg):
+    print(msg)
+
+
+def opt_name(opt):
+    return opt.split('=', 1)[0]
+
+
+def merge_options(default_options, user_options):
+    """merge the defualt options and user options
+
+    Arguments:
+        default_options {list} -- list of options to use
+        user_options {string} -- user configured options comma seperated (comma value can be escaped with \\)
+
+    Returns:
+        list -- merged options
+    """
+    user_options = re.split(r'(?<!\\),', user_options) if user_options else list()
+    if not user_options:  # nothing to do
+        return default_options
+    
+    print(f'user chrome options: {user_options}')
+    
+    options = []
+    remove_opts = []
+    for opt in user_options:
+        opt = opt.strip()
+        if opt.startswith('[') and opt.endswith(']'):
+            remove_opts.append(opt[1:-1])
+        else:
+            options.append(opt.replace(r'\,', ','))
+    # remove values (such as in user-agent)
+    option_names = [opt_name(x) for x in options]
+    # add filtered defaults only if not in removed and we don't have it already
+    options.extend([x for x in default_options if (opt_name(x) not in remove_opts and opt_name(x) not in option_names)])
+    return options
+
+
+def check_response(driver):
+    EMPTY_PAGE = '<html><head></head><body></body></html>'
+    if driver.page_source == EMPTY_PAGE:
+        return_err_or_warn(EMPTY_RESPONSE_ERROR_MSG)
+
+
+def init_driver(offline_mode=False):
+    """
+    Creates headless Google Chrome Web Driver
+    """
+    
+    #global driver
+    print(f'Creating chrome driver. Mode: {"OFFLINE" if offline_mode else "ONLINE"}')
+    
+    try:
+        chrome_options = webdriver.ChromeOptions()
+        for opt in merge_options(DEFAULT_CHROME_OPTIONS, USER_CHROME_OPTIONS):
+            chrome_options.add_argument(opt)
+        chrome_options.binary_location = '/usr/bin/google-chrome'
+        driver = webdriver.Chrome(options=chrome_options, service_args=[f'--log-path={DRIVER_LOG}'])
+        if offline_mode:
+            driver.set_network_conditions(offline=True, latency=5, throughput=500 * 1024)
+    except Exception as ex:
+        print(f'Unexpected exception: {ex}\nTrace:{traceback.format_exc()}')
+        exit()
+
+    print('Creating chrome driver - COMPLETED')
+    return driver
+
+
+def find_zombie_processes():
+    """find zombie proceses
+    Returns:
+        ([process ids], raw ps output) -- return a tuple of zombie process ids and raw ps output
+    """
+    ps_out = subprocess.check_output(['ps', '-e', '-o', 'pid,ppid,state,stime,cmd'],
+                                     stderr=subprocess.STDOUT, universal_newlines=True)
+    lines = ps_out.splitlines()
+    pid = str(os.getpid())
+    zombies = []
+    if len(lines) > 1:
+        for line in lines[1:]:
+            pinfo = line.split()
+            if pinfo[2] == 'Z' and pinfo[1] == pid:  # zombie process
+                zombies.append(pinfo[0])
+    return zombies, ps_out
+
+
+def quit_driver_and_reap_children(driver):
+    """
+    Quits the driver's session and reaps all of zombie child processes
+    :param driver: The driver
+    :return: None
+    """
+    
+    print(f'Quitting driver session: {driver.session_id}')
+    
+    driver.quit()
+    try:
+        zombies, ps_out = find_zombie_processes()
+        if zombies:
+            print(f'Found zombie processes will waitpid: {ps_out}')
+            for pid in zombies:
+                waitres = os.waitpid(int(pid), os.WNOHANG)[1]
+                
+                print(f'waitpid result: {waitres}')
+                
+        else:
+            print(f'No zombie processes found.')
+           
+    except Exception as e:
+        print(f'Failed checking for zombie processes: {e}. Trace: {traceback.format_exc()}')
+
+
+def rasterize(path: str, width: int, height: int, wait_time: int = 0,
+              offline_mode: bool = False, max_page_load_time: int = 180):
+    """
+    Capturing a snapshot of a path (url/file), using Chrome Driver
+    :param offline_mode: when set to True, will block any outgoing communication
+    :param path: file path, or website url
+    :param width: desired snapshot width in pixels
+    :param height: desired snapshot height in pixels
+    :param r_type: result type: .png/.pdf
+    :param wait_time: time in seconds to wait before taking a screenshot
+    """
+    driver = init_driver(offline_mode)
+    page_load_time = max_page_load_time if max_page_load_time > 0 else DEFAULT_PAGE_LOAD_TIME
+    try:
+        print(f'Navigating to path: {path}. Mode: {"OFFLINE" if offline_mode else "ONLINE"}. page load: {page_load_time}')
+        driver.set_page_load_timeout(page_load_time)
+        driver.get(path)
+        driver.implicitly_wait(5)
+        if wait_time > 0 or DEFAULT_WAIT_TIME > 0:
+            time.sleep(wait_time or DEFAULT_WAIT_TIME)
+        check_response(driver)
+        print('Navigating to path - COMPLETED')
+        
+        url = path
+        html = driver.page_source
+        image_b64 = base64.b64encode(get_image(driver, width, height)).decode('utf8')
+        file_name = f'{urlparse(url).netloc}_{datetime.now().strftime("%Y-%m-%dT%H-%M-%S.%f")}'
+        
+        output = Rasterized_Url(image_b64=image_b64, file_name=file_name, html=html, url=url)
+
+        return output
+
+    except (InvalidArgumentException, NoSuchElementException) as ex:
+        if 'invalid argument' in str(ex):
+            err_msg = URL_ERROR_MSG + str(ex)
+            return_err_or_warn(err_msg)
+        else:
+            return_err_or_warn(f'Invalid exception: {ex}\nTrace:{traceback.format_exc()}')
+    except TimeoutException as ex:
+        return_err_or_warn(f'Timeout exception with max load time of: {page_load_time} seconds. {ex}')
+    except Exception as ex:
+        err_str = f'General error: {ex}\nTrace:{traceback.format_exc()}'
+        print(err_str)
+        return_err_or_warn(err_str)
+    finally:
+        quit_driver_and_reap_children(driver)
+
+
+def get_image(driver, width: int, height: int):
+    """
+    Uses the Chrome driver to generate an image out of a currently loaded path
+    :return: .png file of the loaded path
+    """
+    print('Capturing screenshot')
+
+    # Set windows size
+    driver.set_window_size(width, height)
+
+    image = driver.get_screenshot_as_png()
+    driver.quit()
+
+    print('Capturing screenshot - COMPLETED')
+
+    return image
+    
+
+def main():
+    global testout
+    try:
+
+        wait_time = DEFAULT_WAIT_TIME
+        page_load = DEFAULT_PAGE_LOAD_TIME
+
+        url = Rasterize_Url(url='https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb')
+
+        output = rasterize(path=url.url, width=url.width, height=url.height, wait_time=wait_time, max_page_load_time=page_load)
+        # testout = asyncio.run(create_rasterize_url(url))
+
+    except Exception as ex:
+        return_err_or_warn(f'Unexpected exception: {ex}\nTrace:{traceback.format_exc()}')
+           
+
+
+if __name__ in ["__builtin__", "builtins", '__main__']:
+    main()

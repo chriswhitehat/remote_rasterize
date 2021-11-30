@@ -1,0 +1,12 @@
+[Unit]
+Description=Gunicorn instance to serve Remote Rasterize
+After=network.target
+
+[Service]
+User=raster
+Group=raster
+WorkingDirectory=/opt/remote_rasterize/
+ExecStart=/usr/local/bin/gunicorn remote_rasterize:app --workers 4 --worker-class uvicorn.workers.UvicornWorker --keyfile=/opt/remote_rasterize/key.pem --certfile=/opt/remote_rasterize/cert.pem --error-logfile /var/log/remote_rasterize.log --access-logfile /var/log/remote_rasterize.log --capture-output --bind 0.0.0.0:8000
+
+[Install]
+WantedBy=multi-user.target
