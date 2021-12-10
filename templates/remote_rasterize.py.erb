@@ -5,7 +5,7 @@ from fastapi.security.api_key import APIKeyHeader, APIKeyQuery, APIKey
 
 from starlette.status import HTTP_403_FORBIDDEN
 
-from pydantic import BaseModel
+from pydantic import BaseModel, validator
 
 import asyncio
 
@@ -22,34 +22,11 @@ import os
 from datetime import datetime
 from urllib.parse import urlparse
 
-from cryptography.fernet import Fernet
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
-
+import codecs
 
 API_KEY = 'gf6VJkASNWMYUCjrqmzB0DtDhCMahR0MNPTwMeMpWxGnO'
 api_key_header = APIKeyHeader(name="access_token")
 
-
-encrypt_key = b"gf6VJkASNWMYUCjrqmzB0DtDhCMahR0MNPTwMeMpWxGnO"
-salt = b'w\xdb\xfa\xb7T\x9e\x9c\xd6K|e\xc2\xe2$\xa0\xa9'
-
-kdf = PBKDF2HMAC(
-    algorithm=hashes.SHA256(),
-    length=32,
-    salt=salt,
-    iterations=390000,
-)
-
-key = base64.urlsafe_b64encode(kdf.derive(password))
-
-FERNET = Fernet(key)
-
-token = f.encrypt(b"Secret message!")
-
-
-f.decrypt(token)
-b'Secret message!'
 
 # Make sure our python code doesn't go through a proxy when communicating with chrome webdriver
 os.environ['no_proxy'] = 'localhost,127.0.0.1'
@@ -58,6 +35,8 @@ WITH_ERRORS = True
 DEFAULT_WAIT_TIME = 0
 DEFAULT_PAGE_LOAD_TIME = 180
 
+DEFAULT_WIDTH = 2048
+DEFAULT_HIEGHT = 1600
 
 URL_ERROR_MSG = "Can't access the URL. It might be malicious, or unreachable for one of several reasons. " \
                 "You can choose to receive this message as error/warning in the instance settings\n"
@@ -74,8 +53,7 @@ DEFAULT_CHROME_OPTIONS = [
     '--start-maximized',
     '--start-fullscreen',
     '--ignore-certificate-errors',
-    '--disable-dev-shm-usage',
-    f'--user-agent={CHROME_USER_AGENT}'
+    '--disable-dev-shm-usage'
 ]
 
 # Comma separated list of --args
@@ -84,9 +62,25 @@ USER_CHROME_OPTIONS = ""
 
 class Rasterize_Url(BaseModel):
     url: str
-    user_agent: Optional[str] = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.164 Safari/537.36'
-    height: Optional[int] = 1200
-    width: Optional[int] = 1600
+    user_agent: Optional[str]
+    height: Optional[int]
+    width: Optional[int]
+
+    class Config:
+        validate_assignment = True
+
+    @validator('user_agent')
+    def set_user_agent(cls, user_agent: Optional[str]) -> Optional[str]:
+        return user_agent or CHROME_USER_AGENT
+
+    @validator('height')
+    def set_height(cls, height: Optional[int]) -> Optional[int]:
+        return height or DEFAULT_HIEGHT
+
+    @validator('width')
+    def set_width(cls, width: Optional[int]) -> Optional[int]:
+        return width or DEFAULT_WIDTH
+
 
 class Rasterized_Url(BaseModel):
     url: str
@@ -114,16 +108,29 @@ async def get_api_key(
 async def create_rasterize_url(rasterize_url: Rasterize_Url, api_key: APIKey = Depends(get_api_key)):
     rasterize_url_dict = rasterize_url.dict()
 
-    url = rasterize_url.url
-    w = rasterize_url.width
-    h = rasterize_url.height
+    url = codecs.decode(rasterize_url.url, 'rot13')
+    if rasterize_url.width:
+        w = rasterize_url.width
+    else:
+        w = DEFAULT_WIDTH
+
+    if rasterize_url.height:
+        h = rasterize_url.height
+    else:
+        h = DEFAULT_HIEGHT
+
     wait_time = DEFAULT_WAIT_TIME
     page_load = DEFAULT_PAGE_LOAD_TIME
 
     if not (url.startswith('http')):
         url = f"http://{url}"
 
-    output = rasterize(path=url, width=w, height=h, wait_time=wait_time, max_page_load_time=page_load)
+    if rasterize_url.user_agent:
+        chrome_opts = [f'--user-agent={rasterize_url.user_agent}']
+    else:
+        chrome_opts = [f'--user-agent={CHROME_USER_AGENT}']
+
+    output = rasterize(path=url, width=w, height=h, wait_time=wait_time, max_page_load_time=page_load, chrome_opts=chrome_opts)
     
     return output
 
@@ -146,7 +153,6 @@ def merge_options(default_options, user_options):
     Returns:
         list -- merged options
     """
-    user_options = re.split(r'(?<!\\),', user_options) if user_options else list()
     if not user_options:  # nothing to do
         return default_options
     
@@ -173,7 +179,7 @@ def check_response(driver):
         return_err_or_warn(EMPTY_RESPONSE_ERROR_MSG)
 
 
-def init_driver(offline_mode=False):
+def init_driver(offline_mode=False, chrome_opts=[]):
     """
     Creates headless Google Chrome Web Driver
     """
@@ -183,7 +189,7 @@ def init_driver(offline_mode=False):
     
     try:
         chrome_options = webdriver.ChromeOptions()
-        for opt in merge_options(DEFAULT_CHROME_OPTIONS, USER_CHROME_OPTIONS):
+        for opt in merge_options(DEFAULT_CHROME_OPTIONS, chrome_opts):
             chrome_options.add_argument(opt)
         chrome_options.binary_location = '/usr/bin/google-chrome'
         driver = webdriver.Chrome(options=chrome_options, service_args=[f'--log-path={DRIVER_LOG}'])
@@ -242,7 +248,7 @@ def quit_driver_and_reap_children(driver):
 
 
 def rasterize(path: str, width: int, height: int, wait_time: int = 0,
-              offline_mode: bool = False, max_page_load_time: int = 180):
+              offline_mode: bool = False, max_page_load_time: int = 180, chrome_opts: list = []):
     """
     Capturing a snapshot of a path (url/file), using Chrome Driver
     :param offline_mode: when set to True, will block any outgoing communication
@@ -252,7 +258,7 @@ def rasterize(path: str, width: int, height: int, wait_time: int = 0,
     :param r_type: result type: .png/.pdf
     :param wait_time: time in seconds to wait before taking a screenshot
     """
-    driver = init_driver(offline_mode)
+    driver = init_driver(offline_mode, chrome_opts)
     page_load_time = max_page_load_time if max_page_load_time > 0 else DEFAULT_PAGE_LOAD_TIME
     try:
         print(f'Navigating to path: {path}. Mode: {"OFFLINE" if offline_mode else "ONLINE"}. page load: {page_load_time}')
@@ -264,10 +270,10 @@ def rasterize(path: str, width: int, height: int, wait_time: int = 0,
         check_response(driver)
         print('Navigating to path - COMPLETED')
         
-        url = path
-        html = driver.page_source
+        url = codecs.encode(path, 'rot13')
+        html = codecs.encode(driver.page_source, 'rot13')
         image_b64 = base64.b64encode(get_image(driver, width, height)).decode('utf8')
-        file_name = f'{urlparse(url).netloc}_{datetime.now().strftime("%Y-%m-%dT%H-%M-%S.%f")}'
+        file_name = codecs.encode(f'{urlparse(path).netloc}_{datetime.now().strftime("%Y-%m-%dT%H-%M-%S.%f")}', 'rot13')
         
         output = Rasterized_Url(image_b64=image_b64, file_name=file_name, html=html, url=url)
 
